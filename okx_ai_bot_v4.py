@@ -25,20 +25,28 @@ from datetime import datetime, timezone
 CONFIG = {
     "exchange": "okx",
     "okx_demo": True,
-    "market_type": "swap",         # "spot" or "swap"
-    "td_mode": "isolated",         # "isolated" or "cross"
-    "symbol": "BTC/USDT",
+    "market_type": "swap",         # "spot" أو "swap"
+    "td_mode": "isolated",         # "isolated" أو "cross"
+    "symbol": "BTC/USDT:USDT",     # يستخدم عند تعطيل Top20
     "timeframe": "5m",
     "limit_bars": 5000,
     "lookback": 100,
     "fee_rate": 0.0005,
     "slippage_bps": 3,
-    "paper_trading": True,         # True = simulate only (recommended)
+    "paper_trading": False,         # نعتمد تنفيذ ديمو حقيقي وليس محاكاة محلية
+    "execute_orders": True,         # تفعيل إنشاء أوامر فعلية على Sandbox
     "starting_balance": 10000.0,
     "model_path": "model.pkl",
     "capital_pct": 0.85,           # 85% of balance
     "leverage": 10,                # x10
-    "proba_buy_threshold": 0.60,
+    "poll_sec": 10,                 # زمن النوم في الحلقة (ثوانٍ)
+    # (خيارات تسريع الدخولات - Aggressive Entries):
+    "scan_eval_top": 8,             # قيّم فقط أول 8 رموز من Top20 لتقليل التأخير
+    "proba_buy_threshold": 0.60,    # العتبة الأساسية
+    "preentry_margin": 0.05,        # سماح مبكر: ادخل لو p_up ≥ (threshold - 0.05) مع زخم
+    "enable_momentum_gate": True,   # بوابة زخم لتفادي الإشارات الضعيفة
+    "min_rsi": 48,                  # RSI أدنى للزخم
+    "macd_rising_bars": 2,          # عدد شموع ارتفاع متتالية في macd_hist
     "risk": {
         "base_atr_stop_mult": 1.8,
         "base_atr_tp_mult": 3.0,
@@ -317,11 +325,26 @@ class Backtester:
             eq.append(cash+pos*price)
         ret=(eq[-1]/eq[0])-1 if eq else 0; return {"final_equity":eq[-1] if eq else 10000,"return":ret,"n_points":len(eq)}
 
+# ------------- Momentum Helper -------------
+def momentum_ok_from_df(fdf, min_rsi=48, rising_bars=2):
+    # يفترض fdf يحوي أعمدة: macd_hist, rsi14
+    tail = fdf[["macd_hist", "rsi14"]].tail(rising_bars + 1)
+    if len(tail) < rising_bars + 1:
+        return False
+    # ارتفاع متتالي في macd_hist
+    diffs = tail["macd_hist"].diff().tail(rising_bars)
+    rising = (diffs > 0).all()
+    rsi_ok = float(tail["rsi14"].iloc[-1]) >= float(min_rsi)
+    return bool(rising and rsi_ok)
+
 # ------------- Trader -------------
 class Trader:
     def __init__(self, cfg):
         self.cfg=cfg
         self.paper=cfg.get("paper_trading",True)
+        self.execute=bool(cfg.get("execute_orders", False))
+        if not cfg.get("okx_demo", True):
+            self.execute=False
         self.timeframe=cfg["timeframe"]
         self.buy_thr=cfg.get("proba_buy_threshold",0.6)
         self.risk_cfg=cfg.get("risk",{})
@@ -329,6 +352,12 @@ class Trader:
         self.leverage=cfg.get("leverage",10)
         self.top_scan=cfg.get("top_scan",{"enabled":False})
         self.reporting_cfg=cfg.get("reporting",{"hourly":True,"hour_interval_sec":3600})
+        self.poll_sec=int(cfg.get("poll_sec",10))
+        self.scan_eval_top=int(cfg.get("scan_eval_top",8))
+        self.preentry_margin=float(cfg.get("preentry_margin",0.05))
+        self.enable_momentum_gate=bool(cfg.get("enable_momentum_gate",True))
+        self.min_rsi=float(cfg.get("min_rsi",48))
+        self.macd_rising_bars=int(cfg.get("macd_rising_bars",2))
 
         # Telegram
         tel_cfg = cfg.get("telegram", {})
@@ -363,7 +392,14 @@ class Trader:
         self.last_progress_step=None
 
         if tel_cfg.get("enabled") and tel_cfg.get("smart_message_on_start"):
-            send_telegram("🤖 *Smart Trading Bot* بدأ العمل على OKX (ديمو).\n- فحص Top20\n- رافعة x{} \n- استخدام رأس المال: {}%".format(self.leverage, int(self.capital_pct*100)))
+            mode_msg = "EXECUTE: ON (Demo orders)" if self.execute and not self.paper else "PAPER: ON (Simulated)"
+            send_telegram(
+                f"🤖 *Smart Trading Bot* بدأ.\n"
+                f"- وضع: {mode_msg}\n"
+                f"- فحص Top20\n- إطار: {self.timeframe}\n- رافعة: x{self.leverage}\n"
+                f"- استخدام رأس المال: {int(self.capital_pct*100)}%\n"
+                f"- دخول سريع: {'ON' if self.enable_momentum_gate else 'OFF'} | preMargin={self.preentry_margin:.02f}"
+            )
 
     def load_top_symbols(self):
         quote = self.top_scan.get("quote","USDT")
@@ -414,7 +450,10 @@ class Trader:
                     vol = info.get("vol24h") or info.get("volCcy24h") or 0
                 vols.append((s, float(vol or 0.0)))
         vols.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in vols[:n]]
+        symbols = [s for s, _ in vols[:n]]
+        if symbols:
+            symbols = symbols[: self.scan_eval_top]
+        return symbols
 
     def fetch_df(self, symbol, limit=200):
         candles=self.exchange.fetch_ohlcv(symbol, timeframe=self.timeframe, limit=limit)
@@ -434,16 +473,49 @@ class Trader:
         max_notional=self.balance*max_pct*self.leverage
         return max(min(qty, max_notional/price), 0.0)
 
+    def ensure_margin_leverage(self, symbol):
+        try:
+            if hasattr(self.exchange, "set_margin_mode"):
+                self.exchange.set_margin_mode(self.td_mode, symbol, {"posSide":"long"})
+        except Exception:
+            pass
+        try:
+            if hasattr(self.exchange, "set_leverage"):
+                self.exchange.set_leverage(self.leverage, symbol, {"mgnMode": self.td_mode, "posSide":"long"})
+        except Exception:
+            pass
+
+    def compute_qty_contracts(self, symbol, price):
+        market = self.exchange.market(symbol)
+        contract_size = float(market.get("contractSize") or 1.0)
+        notional = self.balance * self.capital_pct * self.leverage
+        max_pct = float(self.risk_cfg.get("max_position_pct", 0.9))
+        notional = min(notional, self.balance * max_pct * self.leverage)
+        contracts = (notional / price) / max(contract_size, 1e-9)
+        try:
+            contracts = float(self.exchange.amount_to_precision(symbol, contracts))
+        except Exception:
+            contracts = float(int(max(1, contracts)))
+        return max(1.0, contracts), contract_size, notional
+
+    def place_open_market(self, symbol, contracts):
+        params = {"tdMode": self.td_mode, "posSide":"long", "reduceOnly": False}
+        return self.exchange.create_order(symbol, "market", "buy", contracts, None, params)
+
+    def place_close_market(self, symbol, contracts):
+        params = {"tdMode": self.td_mode, "posSide":"long", "reduceOnly": True}
+        return self.exchange.create_order(symbol, "market", "sell", contracts, None, params)
+
     def evaluate_candidates(self, symbols):
         best=None
         for s in symbols:
             try:
-                df=self.fetch_df(s, limit=300)
+                df=self.fetch_df(s, limit=150)
                 X_last, meta, fdf=build_features_from_df(df, return_df=True)
                 p_up=self.model.proba_up(X_last)
                 last=fdf.iloc[-1]
                 if best is None or p_up>best[1]:
-                    best=(s, p_up, last)
+                    best=(s, p_up, last, fdf)
             except Exception as e:
                 log.warning(f"Eval failed for {s}: {e}")
         return best
@@ -451,17 +523,50 @@ class Trader:
     def open_position(self, symbol, price, atr, p_up):
         if self.pos is not None: return False
         stop_dist, tp_dist=self.ai_tp_sl(p_up, atr)
-        stop_price=max(0.0, price-stop_dist); tp_price=price+tp_dist; qty=self.compute_qty(price)
+        stop_price=max(0.0, price-stop_dist); tp_price=price+tp_dist
+        if self.execute and not self.paper:
+            try:
+                self.ensure_margin_leverage(symbol)
+                contracts, csize, notional = self.compute_qty_contracts(symbol, price)
+                order = self.place_open_market(symbol, contracts)
+                fill = float(order.get("average") or order.get("price") or price)
+                self.pos={"symbol":symbol,"contracts":contracts,"contractSize":csize,"entry":fill,"stop":stop_price,"tp":tp_price,"open_ts":now_utc(),"p_up":p_up,"atr":atr,"leverage":self.leverage,"pnl_realized":0.0,"side":"long"}
+                send_telegram(f"🟢 *Demo دخول*\nزوج: `{symbol}`\nfill: `{fill:.4f}`\nوقف: `{stop_price:.4f}`\nهدف: `{tp_price:.4f}`\ncontracts: {contracts} | cSize: {csize}\nnotional: {notional:.2f}")
+                return True
+            except Exception as e:
+                log.warning(f"Demo order failed: {e}, switching to PAPER")
+                send_telegram(f"⚠️ فشل تنفيذ الأمر (Demo). التحول إلى PAPER. {e}")
+                self.paper = True
+                self.execute = False
+        qty=self.compute_qty(price)
         self.pos={"symbol":symbol,"qty":qty,"entry":price,"stop":stop_price,"tp":tp_price,"open_ts":now_utc(),"p_up":p_up,"atr":atr,"leverage":self.leverage,"pnl_realized":0.0,"side":"long"}
         send_telegram(f"🧠 *Smart إشارة دخول*\nزوج: `{symbol}`\nاحتمال صعود: *{p_up:.2%}*\nدخول: `{price:.4f}`\nوقف: `{stop_price:.4f}`\nهدف: `{tp_price:.4f}`\nرافعة: x{self.leverage}\nحجم تقريبي: {qty:.4f}")
         return True
 
     def close_position(self, price, reason="signal"):
         if self.pos is None: return
-        qty=self.pos["qty"]; entry=self.pos["entry"]; pnl=(price-entry)*qty*self.leverage
-        self.balance+=pnl; self.pos["pnl_realized"]+=pnl; symbol=self.pos["symbol"]
-        status="ربح ✅" if pnl>=0 else "خسارة ❌"
-        send_telegram(f"⛔ إغلاق الصفقة ({reason})\nزوج: `{symbol}`\nالدخول: `{entry:.4f}`\nالإغلاق: `{price:.4f}`\nالنتيجة: *{status}*\nالربح/الخسارة: `{pnl:.2f}`\nرصيد الجلسة: `{self.balance:.2f}`")
+        symbol=self.pos["symbol"]
+        if "contracts" in self.pos:
+            contracts=self.pos["contracts"]
+            csize=self.pos.get("contractSize",1.0)
+            entry=self.pos["entry"]
+            fill=price
+            if self.execute and not self.paper:
+                try:
+                    order=self.place_close_market(symbol, contracts)
+                    fill=float(order.get("average") or order.get("price") or price)
+                except Exception as e:
+                    log.warning(f"Close order failed: {e}")
+            pnl=(fill-entry)*(contracts*csize)*self.leverage
+            self.balance+=pnl; self.pos["pnl_realized"]+=pnl
+            status="ربح ✅" if pnl>=0 else "خسارة ❌"
+            send_telegram(f"⛔ إغلاق الصفقة ({reason}) [Demo]\nزوج: `{symbol}`\nالدخول: `{entry:.4f}`\nالإغلاق: `{fill:.4f}`\nالنتيجة: *{status}*\nالربح/الخسارة: `{pnl:.2f}`\nرصيد الجلسة: `{self.balance:.2f}`")
+        else:
+            qty=self.pos["qty"]; entry=self.pos["entry"]
+            pnl=(price-entry)*qty*self.leverage
+            self.balance+=pnl; self.pos["pnl_realized"]+=pnl
+            status="ربح ✅" if pnl>=0 else "خسارة ❌"
+            send_telegram(f"⛔ إغلاق الصفقة ({reason})\nزوج: `{symbol}`\nالدخول: `{entry:.4f}`\nالإغلاق: `{price:.4f}`\nالنتيجة: *{status}*\nالربح/الخسارة: `{pnl:.2f}`\nرصيد الجلسة: `{self.balance:.2f}`")
         self.pos=None; self.last_progress_step=None
 
     def progress_update_if_needed(self, price):
@@ -478,16 +583,28 @@ class Trader:
         if self.last_report_ts is None or (now - self.last_report_ts).total_seconds() >= int(self.reporting_cfg.get("hour_interval_sec", 3600)):
             unreal=0.0
             if self.pos is not None and price is not None:
-                unreal=(price-self.pos["entry"])*self.pos["qty"]*self.pos["leverage"]
+                if "contracts" in self.pos:
+                    unreal=(price-self.pos["entry"])*(self.pos["contracts"]*self.pos.get("contractSize",1.0))*self.pos["leverage"]
+                else:
+                    unreal=(price-self.pos["entry"])*self.pos["qty"]*self.pos["leverage"]
             total_pnl=(self.balance - float(self.cfg.get("starting_balance", 10000.0)))
             send_telegram(f"🕒 تقرير ساعة\nالربح/الخسارة الكلية منذ البداية: `{total_pnl:.2f}`\nالربح/الخسارة غير المحققة: `{unreal:.2f}`\nالرصيد التقريبي: `{self.balance + unreal:.2f}`")
             self.last_report_ts = now
 
     def run_loop(self):
-        log.info(f"Starting {'PAPER' if self.paper else 'LIVE'} trading on OKX {self.market_type} @ {self.timeframe}")
+        mode = "PAPER"
+        if self.execute and not self.paper:
+            mode = "DEMO EXEC"
+        elif not self.paper:
+            mode = "LIVE"
+        log.info(f"Starting {mode} trading on OKX {self.market_type} @ {self.timeframe}")
+        send_telegram(
+            f"⚙️ وضع الدخول: Aggressive — tf={self.timeframe}, thr={self.buy_thr:.2f}, preMargin={self.preentry_margin:.2f}, poll={self.poll_sec}s"
+        )
         symbols=None
         if self.top_scan.get("enabled"):
-            symbols=self.load_top_symbols(); log.info(f"Top symbols: {symbols}")
+            symbols=self.load_top_symbols()
+            log.info(f"Top symbols: {symbols}")
             send_telegram("🔎 فحص Top20 تم — عدد الأزواج: {}".format(len(symbols)))
         while True:
             try:
@@ -495,23 +612,43 @@ class Trader:
                     if self.top_scan.get("enabled"):
                         best=self.evaluate_candidates(symbols or [])
                         if best is not None:
-                            sym, p_up, last = best; price=float(last["close"]); atr=float(last.get("atr14", 0.0))
-                            if p_up>=self.buy_thr: self.open_position(sym, price, atr, p_up)
+                            sym, p_up, last, fdf = best
+                            price=float(last["close"]); atr=float(last.get("atr14", 0.0))
+                            early_allowed = p_up >= (self.buy_thr - self.preentry_margin)
+                            ok_momentum = True
+                            if self.enable_momentum_gate:
+                                ok_momentum = momentum_ok_from_df(
+                                    fdf, self.min_rsi, self.macd_rising_bars
+                                )
+                            if p_up >= self.buy_thr or (early_allowed and ok_momentum):
+                                self.open_position(sym, price, atr, p_up)
                     else:
-                        sym=self.cfg["symbol"]; df=self.fetch_df(sym, limit=300)
-                        X_last, meta, fdf = build_features_from_df(df, return_df=True); p_up=self.model.proba_up(X_last); last=fdf.iloc[-1]
+                        sym=self.cfg["symbol"]
+                        df=self.fetch_df(sym, limit=150)
+                        X_last, meta, fdf = build_features_from_df(df, return_df=True)
+                        p_up=self.model.proba_up(X_last)
+                        last=fdf.iloc[-1]
                         price=float(last["close"]); atr=float(last.get("atr14",0.0))
-                        if p_up>=self.buy_thr: self.open_position(sym, price, atr, p_up)
+                        early_allowed = p_up >= (self.buy_thr - self.preentry_margin)
+                        ok_momentum = True
+                        if self.enable_momentum_gate:
+                            ok_momentum = momentum_ok_from_df(
+                                fdf, self.min_rsi, self.macd_rising_bars
+                            )
+                        if p_up >= self.buy_thr or (early_allowed and ok_momentum):
+                            self.open_position(sym, price, atr, p_up)
                 else:
                     sym=self.pos["symbol"]; df=self.fetch_df(sym, limit=5); price=float(df["close"].iloc[-1])
                     self.progress_update_if_needed(price)
                     if price>=self.pos["tp"]: self.close_position(price, reason="TP")
                     elif price<=self.pos["stop"]: self.close_position(price, reason="SL")
-                if self.pos is None: self.hourly_report_if_needed()
-                else: self.hourly_report_if_needed(price)
-                time.sleep(10)
+                if self.pos is None:
+                    self.hourly_report_if_needed()
+                else:
+                    self.hourly_report_if_needed(price)
+                time.sleep(self.poll_sec)
             except Exception as e:
-                log.exception(f"Loop error: {e}"); time.sleep(10)
+                log.exception(f"Loop error: {e}"); time.sleep(self.poll_sec)
 
 # ------------- Commands -------------
 def cmd_download(args):
